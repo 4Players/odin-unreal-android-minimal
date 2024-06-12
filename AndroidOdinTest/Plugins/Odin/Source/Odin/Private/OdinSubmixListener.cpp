@@ -1,5 +1,4 @@
-/* Copyright (c) 2022-2023 4Players GmbH. All rights reserved. */
-
+/* Copyright (c) 2022-2024 4Players GmbH. All rights reserved. */
 
 #include "OdinSubmixListener.h"
 #include "Odin.h"
@@ -11,55 +10,66 @@
 
 using namespace Audio;
 
-UOdinSubmixListener::UOdinSubmixListener(const class FObjectInitializer &PCIP)
-    : Super(PCIP)
+FOdinSubmixListener::FOdinSubmixListener(): bInitialized(false), current_room_handle(0)
 {
     resampler_handle = 0;
 }
 
-UOdinSubmixListener::~UOdinSubmixListener()
+FOdinSubmixListener::~FOdinSubmixListener()
 {
-    if (bInitialized)
-        StopSubmixListener();
-
     if (resampler_handle != 0)
         odin_resampler_destroy(resampler_handle);
 }
 
-void UOdinSubmixListener::StartSubmixListener()
+void FOdinSubmixListener::StartSubmixListener(TSharedPtr<FOdinSubmixListener> SubmixListenerPtr)
 {
     if (bInitialized || !GEngine)
         return;
 
-    FAudioDeviceHandle AudioDevice = GEngine->GetActiveAudioDevice();
+    const FOdinModule OdinModule = FModuleManager::GetModuleChecked<FOdinModule>("Odin");
+    OdinSampleRate               = OdinModule.GetSampleRate();
+    OdinChannels                 = OdinModule.GetChannelCount();
 
-    int32 samplerate = AudioDevice->SampleRate;
-    if (samplerate != OdinSampleRate) {
-        UE_LOG(Odin, Warning, TEXT("Creating resampler. Samplerate of %d mismatch %d"),
-               AudioDevice->SampleRate, OdinSampleRate);
-        // resampler_handle = odin_resampler_create(samplerate, OdinSampleRate, OdinChannels);
+    UE_LOG(Odin, Log, TEXT("Starting Submix Listener with OdinSampleRate %d and OdinChannels %d"),
+           OdinSampleRate, OdinChannels);
+
+    FAudioDeviceHandle AudioDevice = GEngine->GetActiveAudioDevice();
+    const int32        SampleRate  = AudioDevice->SampleRate;
+    if (SampleRate != OdinSampleRate) {
+        UE_LOG(Odin, Warning,
+               TEXT("Detected difference in sample rate: %d In Sample Rate and %d Odin Sample "
+                    "Rate. Echo Cancellation will not work correctly!"),
+               SampleRate, OdinSampleRate);
     }
 
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 4
+    USoundSubmix& MainSubmixObject = AudioDevice->GetMainSubmixObject();
+    AudioDevice->RegisterSubmixBufferListener(SubmixListenerPtr.ToSharedRef(), MainSubmixObject);
+#else
     AudioDevice->RegisterSubmixBufferListener(this);
+#endif
     bInitialized = true;
 }
 
-void UOdinSubmixListener::StopSubmixListener()
+void FOdinSubmixListener::StopSubmixListener(TSharedPtr<FOdinSubmixListener> SubmixListenerPtr)
 {
     if (!bInitialized || !GEngine)
         return;
-
     FAudioDeviceHandle AudioDevice = GEngine->GetActiveAudioDevice();
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 4
+    AudioDevice->UnregisterSubmixBufferListener(SubmixListenerPtr.ToSharedRef(), AudioDevice->GetMainSubmixObject());
+#else
     AudioDevice->UnregisterSubmixBufferListener(this);
+#endif
     bInitialized = false;
 }
 
-void UOdinSubmixListener::SetRoom(OdinRoomHandle room)
+void FOdinSubmixListener::SetRoom(OdinRoomHandle room)
 {
     current_room_handle = room;
 }
 
-void UOdinSubmixListener::OnNewSubmixBuffer(const USoundSubmix *OwningSubmix, float *AudioData,
+void FOdinSubmixListener::OnNewSubmixBuffer(const USoundSubmix *OwningSubmix, float *AudioData,
                                             int32 InNumSamples, int32 InNumChannels,
                                             const int32 InSampleRate, double InAudioClock)
 {
@@ -68,9 +78,25 @@ void UOdinSubmixListener::OnNewSubmixBuffer(const USoundSubmix *OwningSubmix, fl
 
     FScopeLock Lock(&submix_cs_);
 
+    UE_LOG(Odin, VeryVerbose,
+           TEXT("In Channels: %d In SampleRate: %d In Num Samples: %d In Audio Clock: %f"),
+           InNumChannels, InSampleRate, InNumSamples, InAudioClock);
+
     TSampleBuffer<float> buffer(AudioData, InNumSamples, InNumChannels, InSampleRate);
-    if (buffer.GetNumChannels() != OdinChannels)
+    if (buffer.GetNumChannels() != OdinChannels) {
+        UE_LOG(Odin, VeryVerbose,
+               TEXT("Due to differences in Channel Count, remixing buffer from %d Channels to %d "
+                    "OdinChannels"),
+               InNumChannels, OdinChannels);
         buffer.MixBufferToChannels(OdinChannels);
+    }
+
+    if (InSampleRate != OdinSampleRate) {
+        UE_LOG(Odin, Verbose,
+               TEXT("InSampleRate %d !== OdinSampleRate %d - Echo Cancellation will not work "
+                    "correctly!"),
+               InSampleRate, OdinSampleRate);
+    }
 
     float         *pbuffer = buffer.GetArrayView().GetData();
     OdinReturnCode result =
@@ -81,6 +107,5 @@ void UOdinSubmixListener::OnNewSubmixBuffer(const USoundSubmix *OwningSubmix, fl
         UE_LOG(Odin, Verbose, TEXT("OnNewSubmixBuffer on %s "),
                *OwningSubmix->GetFName().ToString());
 
-        StopSubmixListener();
     }
 }
